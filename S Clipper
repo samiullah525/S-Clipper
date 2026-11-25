@@ -1,0 +1,1387 @@
+cat << 'EOF' > setup_webapp.py
+from pathlib import Path
+
+Path("static").mkdir(exist_ok=True)
+Path("data/uploads").mkdir(parents=True, exist_ok=True)
+Path("data/exports").mkdir(parents=True, exist_ok=True)
+
+Path("requirements.txt").write_text("""fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+httpx==0.28.1
+google-genai>=1.10.0,<3.0.0
+faster-whisper>=1.1.0
+python-multipart==0.0.20
+""", encoding="utf-8")
+
+Path("run.sh").write_text("""#!/usr/bin/env bash
+set -e
+echo ">>> Installing FFmpeg & fonts..."
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+fi
+
+echo ">>> Installing Python packages..."
+pip install -q -r requirements.txt
+
+if [ ! -f .env ]; then
+  echo ""
+  read -p "Paste your GEMINI_API_KEY and press Enter: " GKEY
+  SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+  printf "GEMINI_API_KEY=%s\nAPP_SECRET=%s\nWHISPER_MODEL=base\n" "$GKEY" "$SECRET" > .env
+fi
+
+echo ""
+echo "===================================================="
+echo " VIRAL CLIPPER IS RUNNING ON PORT 8000!"
+echo " In Codespaces: open 'Ports' tab -> set port 8000"
+echo " visibility to 'Public' -> tap the Globe icon!"
+echo "===================================================="
+uvicorn app:app --host 0.0.0.0 --port 8000
+""", encoding="utf-8")
+
+Path("app.py").write_text(r'''import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import shutil
+import sqlite3
+import time
+import uuid
+from collections import defaultdict
+from pathlib import Path
+from typing import Literal
+
+import httpx
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from faster_whisper import WhisperModel
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
+
+# Load .env manually (zero extra dependency)
+if Path(".env").exists():
+    for line in Path(".env").read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.strip().startswith("#"):
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+APP_SECRET = os.environ.get("APP_SECRET", "dev-secret-change-me")
+WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "base")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+UPLOADS_DIR = DATA_DIR / "uploads"
+EXPORTS_DIR = DATA_DIR / "exports"
+WORK_DIR = DATA_DIR / "work"
+DB_PATH = DATA_DIR / "viral_clipper.db"
+
+for d in (UPLOADS_DIR, EXPORTS_DIR, WORK_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+YOUTUBE_REGEX = re.compile(
+    r"^(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?.*v=|shorts/|live/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})(?:[&?/].*)?$"
+)
+
+# ---------- Database ----------
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                full_name TEXT NOT NULL DEFAULT '',
+                password_hash TEXT NOT NULL,
+                default_quality TEXT NOT NULL DEFAULT '1080p',
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                youtube_url TEXT NOT NULL,
+                youtube_video_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                channel_name TEXT DEFAULT '',
+                thumbnail_url TEXT DEFAULT '',
+                source_path TEXT NOT NULL,
+                duration_seconds REAL DEFAULT 0,
+                width INTEGER DEFAULT 0,
+                height INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                progress INTEGER NOT NULL DEFAULT 0,
+                current_stage TEXT NOT NULL DEFAULT 'Queued',
+                error_message TEXT,
+                transcript_json TEXT DEFAULT '[]',
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS clips (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                hook_reason TEXT DEFAULT '',
+                viral_score INTEGER DEFAULT 80,
+                tags_json TEXT DEFAULT '[]',
+                start_seconds REAL NOT NULL,
+                end_seconds REAL NOT NULL,
+                crop_mode TEXT NOT NULL DEFAULT 'center_crop',
+                caption_position TEXT NOT NULL DEFAULT 'bottom',
+                export_status TEXT NOT NULL DEFAULT 'idle',
+                export_progress INTEGER NOT NULL DEFAULT 0,
+                export_stage TEXT DEFAULT '',
+                export_resolution TEXT DEFAULT '',
+                export_path TEXT,
+                export_size_bytes INTEGER DEFAULT 0,
+                export_error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS captions (
+                id TEXT PRIMARY KEY,
+                clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                seq_index INTEGER NOT NULL,
+                start_seconds REAL NOT NULL,
+                end_seconds REAL NOT NULL,
+                text TEXT NOT NULL,
+                words_json TEXT DEFAULT '[]'
+            );
+            """
+        )
+
+
+init_db()
+
+# ---------- Auth Helpers ----------
+def hash_password(password: str, salt: str | None = None) -> str:
+    salt = salt or uuid.uuid4().hex
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000).hex()
+    return f"{salt}${dk}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    salt, dk = stored.split("$", 1)
+    return hmac.compare_digest(hash_password(password, salt), stored)
+
+
+def create_token(user_id: str, email: str) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps({"uid": user_id, "email": email, "exp": time.time() + 86400 * 7}).encode()).decode()
+    sig = hmac.new(APP_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def decode_token(token: str) -> dict:
+    try:
+        payload, sig = token.rsplit(".", 1)
+        expected = hmac.new(APP_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise ValueError("Bad signature")
+        data = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        if data["exp"] < time.time():
+            raise ValueError("Expired")
+        return data
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired session. Please sign in again.") from exc
+
+
+async def get_current_user(
+    authorization: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+) -> dict:
+    raw = None
+    if authorization and authorization.lower().startswith("bearer "):
+        raw = authorization.split(" ", 1)[1].strip()
+    elif token:
+        raw = token.strip()
+    if not raw:
+        raise HTTPException(status_code=401, detail="Missing authentication token.")
+    data = decode_token(raw)
+    with get_db() as conn:
+        user = conn.execute("SELECT id, email, full_name, default_quality FROM users WHERE id = ?", (data["uid"],)).fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found.")
+    return dict(user)
+
+
+# ---------- SSE Event Bus ----------
+class EventBus:
+    def __init__(self) -> None:
+        self._subs: dict[str, set[asyncio.Queue[str]]] = defaultdict(set)
+
+    async def subscribe(self, key: str) -> asyncio.Queue[str]:
+        q: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
+        self._subs[key].add(q)
+        return q
+
+    def unsubscribe(self, key: str, q: asyncio.Queue[str]) -> None:
+        self._subs[key].discard(q)
+
+    async def publish(self, key: str, payload: dict) -> None:
+        encoded = json.dumps(payload)
+        for q in list(self._subs.get(key, ())):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            await q.put(encoded)
+
+
+bus = EventBus()
+
+# ---------- Schemas ----------
+class AuthBody(BaseModel):
+    email: str
+    password: str
+    full_name: str = ""
+
+
+class UpdateClipBody(BaseModel):
+    start_seconds: float | None = None
+    end_seconds: float | None = None
+    crop_mode: Literal["center_crop", "fit_blur"] | None = None
+    caption_position: Literal["bottom", "center", "top"] | None = None
+
+
+class CaptionCueIn(BaseModel):
+    seq_index: int = 0
+    start_seconds: float
+    end_seconds: float
+    text: str
+
+
+class UpdateCaptionsBody(BaseModel):
+    captions: list[CaptionCueIn]
+
+
+class ExportBody(BaseModel):
+    quality: Literal["1080p", "720p"] = "1080p"
+    crop_mode: Literal["center_crop", "fit_blur"] = "center_crop"
+    caption_position: Literal["bottom", "center", "top"] = "bottom"
+
+
+class GeminiClip(BaseModel):
+    title: str
+    start_seconds: float
+    end_seconds: float
+    viral_score: int = Field(ge=1, le=100)
+    hook_reason: str
+    tags: list[str]
+
+
+class ViralAnalysisResult(BaseModel):
+    clips: list[GeminiClip]
+
+
+# ---------- Media / AI Helpers ----------
+_whisper_model: WhisperModel | None = None
+
+
+def get_whisper() -> WhisperModel:
+    global _whisper_model
+    if _whisper_model is None:
+        _whisper_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def validate_yt(url: str) -> tuple[str, str]:
+    m = YOUTUBE_REGEX.match(url.strip())
+    if not m:
+        raise HTTPException(status_code=422, detail="Invalid YouTube URL (use watch?v=, youtu.be/, or shorts/).")
+    vid = m.group(1)
+    return vid, f"https://www.youtube.com/watch?v={vid}"
+
+
+async def fetch_oembed(canonical_url: str) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get("https://www.youtube.com/oembed", params={"url": canonical_url, "format": "json"})
+            if r.status_code == 200:
+                d = r.json()
+                return {
+                    "title": d.get("title", "YouTube Video"),
+                    "channel_name": d.get("author_name", ""),
+                    "thumbnail_url": d.get("thumbnail_url", ""),
+                }
+    except Exception:
+        pass
+    return {"title": "YouTube Video", "channel_name": "", "thumbnail_url": ""}
+
+
+async def ffprobe_video(path: Path) -> dict:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"FFprobe failed: {err.decode(errors='ignore')}")
+    info = json.loads(out.decode())
+    vs = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+    if not vs:
+        raise ValueError("Uploaded file has no valid video stream.")
+    aus = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), None)
+    dur = float(info.get("format", {}).get("duration") or vs.get("duration") or 0)
+    if dur <= 0:
+        raise ValueError("Invalid video duration.")
+    return {
+        "duration": dur,
+        "width": int(vs.get("width", 0)),
+        "height": int(vs.get("height", 0)),
+        "has_audio": aus is not None,
+    }
+
+
+def slice_captions(transcript: list[dict], clip_start: float, clip_end: float, max_words: int = 5) -> list[dict]:
+    words_in_range: list[dict] = []
+    for seg in transcript:
+        words = seg.get("words") or []
+        if words:
+            for w in words:
+                ws, we = float(w["start"]), float(w["end"])
+                if we > clip_start and ws < clip_end:
+                    rs = max(0.0, ws - clip_start)
+                    re_ = min(clip_end - clip_start, max(rs + 0.12, we - clip_start))
+                    tok = w["word"].strip()
+                    if tok:
+                        words_in_range.append({"word": tok, "start": round(rs, 3), "end": round(re_, 3)})
+        else:
+            ss, se = float(seg["start"]), float(seg["end"])
+            if se > clip_start and ss < clip_end:
+                toks = seg["text"].strip().split()
+                if toks:
+                    rs, re_ = max(0.0, ss - clip_start), min(clip_end - clip_start, se - clip_start)
+                    step = max(0.15, (re_ - rs) / len(toks))
+                    for i, tok in enumerate(toks):
+                        words_in_range.append({"word": tok, "start": round(rs + i * step, 3), "end": round(min(re_, rs + (i + 1) * step), 3)})
+
+    cues = []
+    for idx, i in enumerate(range(0, len(words_in_range), max_words)):
+        chunk = words_in_range[i : i + max_words]
+        if not chunk:
+            continue
+        cues.append({
+            "seq_index": idx,
+            "start_seconds": round(chunk[0]["start"], 3),
+            "end_seconds": round(max(chunk[0]["start"] + 0.25, chunk[-1]["end"]), 3),
+            "text": " ".join(x["word"] for x in chunk),
+            "words_json": chunk,
+        })
+    return cues
+
+
+def _transcribe_sync(wav_path: Path) -> list[dict]:
+    model = get_whisper()
+    segs, _ = model.transcribe(str(wav_path), beam_size=4, vad_filter=True, word_timestamps=True)
+    out = []
+    for s in segs:
+        txt = s.text.strip()
+        if not txt:
+            continue
+        words = [
+            {"word": w.word.strip(), "start": round(float(w.start), 3), "end": round(float(w.end), 3)}
+            for w in (s.words or []) if w.word.strip()
+        ]
+        out.append({"start": round(float(s.start), 3), "end": round(float(s.end), 3), "text": txt, "words": words})
+    return out
+
+
+def _gemini_sync(proxy_path: Path, title: str, duration: float, transcript: list[dict]) -> list[GeminiClip]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing in .env.")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    uploaded = None
+    try:
+        uploaded = client.files.upload(file=str(proxy_path))
+        deadline = time.time() + 180
+        while getattr(uploaded.state, "name", "") == "PROCESSING":
+            if time.time() > deadline:
+                raise TimeoutError("Gemini video processing timed out.")
+            time.sleep(2)
+            uploaded = client.files.get(name=uploaded.name)
+        if getattr(uploaded.state, "name", "") == "FAILED":
+            raise RuntimeError("Gemini failed to process video.")
+
+        tr_lines = "\n".join(f"[{s['start']:.2f}s - {s['end']:.2f}s] {s['text']}" for s in transcript[:300]) or "(No speech detected)"
+        prompt = f"""Analyze "{title}" (duration {duration:.2f}s) and this transcript:
+{tr_lines}
+
+Return 3 to 5 high-retention vertical 9:16 viral clip segments between 10s and 60s (or shorter only if total video < 12s).
+Align start_seconds and end_seconds cleanly inside [0.0, {duration:.2f}]."""
+
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[uploaded, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ViralAnalysisResult,
+                temperature=0.35,
+            ),
+        )
+        parsed = resp.parsed if isinstance(resp.parsed, ViralAnalysisResult) else ViralAnalysisResult.model_validate_json(resp.text)
+        clean = []
+        for c in parsed.clips:
+            st = max(0.0, min(c.start_seconds, max(0.0, duration - 2.0)))
+            en = min(duration, max(st + 2.0, c.end_seconds))
+            if en - st >= 2.0:
+                clean.append(GeminiClip(title=c.title[:100], start_seconds=round(st, 2), end_seconds=round(en, 2), viral_score=c.viral_score, hook_reason=c.hook_reason, tags=c.tags[:4]))
+        return sorted(clean, key=lambda x: x.viral_score, reverse=True)
+    finally:
+        if uploaded is not None:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
+        client.close()
+
+
+# ---------- Background Pipelines ----------
+async def run_analysis(project_id: str) -> None:
+    job_dir = WORK_DIR / f"analyze_{project_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    chan = f"project:{project_id}"
+
+    async def set_state(status: str, stage: str, progress: int, err: str | None = None) -> None:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE projects SET status=?, current_stage=?, progress=?, error_message=? WHERE id=?",
+                (status, stage, progress, err, project_id),
+            )
+        await bus.publish(chan, {"status": status, "stage": stage, "progress": progress, "message": err or ""})
+
+    try:
+        with get_db() as conn:
+            proj = dict(conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
+        src = Path(proj["source_path"])
+
+        await set_state("ingesting", "Probing video metadata with FFprobe", 18)
+        meta = await ffprobe_video(src)
+        with get_db() as conn:
+            conn.execute("UPDATE projects SET duration_seconds=?, width=?, height=? WHERE id=?", (meta["duration"], meta["width"], meta["height"], project_id))
+
+        transcript: list[dict] = []
+        if meta["has_audio"]:
+            await set_state("transcribing", "Extracting audio & running Whisper STT", 38)
+            wav = job_dir / "audio.wav"
+            proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await proc.communicate()
+            if wav.exists():
+                transcript = await asyncio.to_thread(_transcribe_sync, wav)
+
+        await set_state("analyzing", "Preparing compact proxy for Gemini AI", 62)
+        proxy = job_dir / "proxy.mp4"
+        proc2 = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(src), "-vf", "scale=-2:480", "-r", "2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32", "-c:a", "aac", "-b:a", "64k", str(proxy),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc2.communicate()
+        target_for_ai = proxy if proxy.exists() and proxy.stat().st_size > 0 else src
+
+        await set_state("analyzing", "Detecting viral hooks via Gemini AI", 76)
+        clips = await asyncio.to_thread(_gemini_sync, target_for_ai, proj["title"], meta["duration"], transcript)
+        if not clips:
+            raise RuntimeError("AI found no valid clip segments.")
+
+        await set_state("analyzing", "Synchronizing word-level captions", 92)
+        with get_db() as conn:
+            conn.execute("UPDATE projects SET transcript_json=? WHERE id=?", (json.dumps(transcript), project_id))
+            conn.execute("DELETE FROM clips WHERE project_id=?", (project_id,))
+            for c in clips:
+                cid = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO clips (id, project_id, user_id, title, hook_reason, viral_score, tags_json, start_seconds, end_seconds) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (cid, project_id, proj["user_id"], c.title, c.hook_reason, c.viral_score, json.dumps(c.tags), c.start_seconds, c.end_seconds),
+                )
+                for cue in slice_captions(transcript, c.start_seconds, c.end_seconds):
+                    conn.execute(
+                        "INSERT INTO captions (id, clip_id, seq_index, start_seconds, end_seconds, text, words_json) VALUES (?,?,?,?,?,?,?)",
+                        (str(uuid.uuid4()), cid, cue["seq_index"], cue["start_seconds"], cue["end_seconds"], cue["text"], json.dumps(cue["words_json"])),
+                    )
+
+        await set_state("ready", f"Ready! {len(clips)} viral clips detected", 100)
+    except Exception as exc:
+        await set_state("failed", "Analysis Failed", 0, str(exc))
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _fmt_ass_time(sec: float) -> str:
+    sec = max(0.0, sec)
+    h, rem = int(sec // 3600), sec % 3600
+    m, s = int(rem // 60), rem % 60
+    return f"{h}:{m:02d}:{int(s):02d}.{int(round((s - int(s))*100)):02d}"
+
+
+def write_ass(captions: list[dict], pos: str, w: int, h: int, path: Path) -> None:
+    align = 2 if pos == "bottom" else (5 if pos == "center" else 8)
+    margin_v = 220 if pos == "bottom" else (80 if pos == "top" else 0)
+    fsize = 62 if h >= 1500 else 42
+    lines = [
+        f"[Script Info]\nScriptType: v4.00+\nPlayResX: {w}\nPlayResY: {h}\n\n"
+        f"[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,DejaVu Sans,{fsize},&H00FFFFFF,&H00FFE500,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,{align},50,50,{margin_v},1\n\n"
+        f"[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    ]
+    for cue in captions:
+        txt = str(cue["text"]).replace("\n", "\\N").upper()
+        lines.append(f"Dialogue: 0,{_fmt_ass_time(cue['start_seconds'])},{_fmt_ass_time(cue['end_seconds'])},Default,,0,0,0,,{txt}\n")
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+async def run_export(clip_id: str, quality: str, crop_mode: str, caption_pos: str) -> None:
+    job_dir = WORK_DIR / f"export_{clip_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    chan = f"clip:{clip_id}"
+
+    async def set_exp(status: str, stage: str, progress: int, err: str | None = None, **extra) -> None:
+        with get_db() as conn:
+            fields = ["export_status=?", "export_stage=?", "export_progress=?", "export_error=?"]
+            vals = [status, stage, progress, err]
+            for k, v in extra.items():
+                fields.append(f"{k}=?")
+                vals.append(v)
+            vals.append(clip_id)
+            conn.execute(f"UPDATE clips SET {','.join(fields)} WHERE id=?", vals)
+        await bus.publish(chan, {"status": status, "stage": stage, "progress": progress, "message": err or ""})
+
+    try:
+        with get_db() as conn:
+            clip = dict(conn.execute("SELECT * FROM clips WHERE id=?", (clip_id,)).fetchone())
+            proj = dict(conn.execute("SELECT * FROM projects WHERE id=?", (clip["project_id"],)).fetchone())
+            captions = [dict(r) for r in conn.execute("SELECT * FROM captions WHERE clip_id=? ORDER BY seq_index ASC", (clip_id,)).fetchall()]
+
+        src = Path(proj["source_path"])
+        meta = await ffprobe_video(src)
+        if quality == "1080p" and max(meta["width"], meta["height"]) >= 1080:
+            tw, th = 1080, 1920
+        else:
+            tw, th = 720, 1280
+
+        dur = max(0.5, float(clip["end_seconds"]) - float(clip["start_seconds"]))
+        await set_exp("rendering", f"Rendering {tw}x{th} 9:16 MP4...", 15)
+
+        if crop_mode == "fit_blur":
+            base_vf = f"split[bg][fg];[bg]scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},gblur=sigma=28[b];[fg]scale={tw}:{th}:force_original_aspect_ratio=decrease[f];[b][f]overlay=(W-w)/2:(H-h)/2"
+        else:
+            base_vf = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th}"
+
+        if captions:
+            write_ass(captions, caption_pos, tw, th, job_dir / "captions.ass")
+            vf = f"{base_vf},ass=captions.ass,format=yuv420p"
+        else:
+            vf = f"{base_vf},format=yuv420p"
+
+        out_file = EXPORTS_DIR / f"{clip_id}.mp4"
+        cmd = [
+            "ffmpeg", "-y", "-ss", f"{clip['start_seconds']:.3f}", "-i", str(src), "-t", f"{dur:.3f}",
+            "-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", "19", "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "192k", "-progress", "pipe:1", "-nostats", str(out_file),
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(job_dir), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        last_pct = 15
+        assert proc.stdout is not None
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode(errors="ignore").strip()
+            if line.startswith("out_time_us="):
+                try:
+                    us = int(line.split("=", 1)[1])
+                    pct = min(96, 15 + int((us / (dur * 1_000_000)) * 80))
+                    if pct >= last_pct + 3:
+                        last_pct = pct
+                        await set_exp("rendering", f"Encoding MP4 ({pct}%)", pct)
+                except ValueError:
+                    pass
+        _, err = await proc.communicate()
+        if proc.returncode != 0 or not out_file.exists():
+            raise RuntimeError(err.decode(errors="ignore")[-400:])
+
+        final_meta = await ffprobe_video(out_file)
+        res_label = f"{final_meta['width']}x{final_meta['height']}"
+        await set_exp(
+            "completed", "Export complete!", 100,
+            export_path=str(out_file),
+            export_resolution=res_label,
+            export_size_bytes=out_file.stat().st_size,
+        )
+    except Exception as exc:
+        await set_exp("failed", "Export failed", 0, str(exc))
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ---------- FastAPI App & Routes ----------
+app = FastAPI(title="VIRAL CLIPPER Web Studio")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_spa():
+    return HTMLResponse(Path("static/index.html").read_text(encoding="utf-8"))
+
+
+@app.post("/api/auth/register")
+async def register(body: AuthBody):
+    if len(body.password) < 6 or "@" not in body.email:
+        raise HTTPException(422, "Provide valid email and 6+ char password.")
+    uid = str(uuid.uuid4())
+    email = body.email.strip().lower()
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO users (id, email, full_name, password_hash, created_at) VALUES (?,?,?,?,?)",
+                (uid, email, body.full_name.strip(), hash_password(body.password), time.time()),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "Account with this email already exists.") from exc
+    return {"token": create_token(uid, email), "user": {"id": uid, "email": email, "full_name": body.full_name.strip()}}
+
+
+@app.post("/api/auth/login")
+async def login(body: AuthBody):
+    email = body.email.strip().lower()
+    with get_db() as conn:
+        user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if not user or not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid email or password.")
+    return {
+        "token": create_token(user["id"], email),
+        "user": {"id": user["id"], "email": email, "full_name": user["full_name"], "default_quality": user["default_quality"]},
+    }
+
+
+@app.get("/api/me")
+async def me(user: dict = Depends(get_current_user)):
+    return user
+
+
+@app.get("/api/projects/validate-youtube")
+async def api_validate_yt(url: str = Query(...), user: dict = Depends(get_current_user)):
+    vid, canonical = validate_yt(url)
+    meta = await fetch_oembed(canonical)
+    return {"valid": True, "video_id": vid, "canonical_url": canonical, **meta}
+
+
+@app.post("/api/projects")
+async def create_project(
+    background_tasks: BackgroundTasks,
+    youtube_url: str = Form(...),
+    rights_confirmed: bool = Form(...),
+    video_file: UploadFile | None = File(default=None),
+    direct_url: str | None = Form(default=None),
+    user: dict = Depends(get_current_user),
+):
+    if not rights_confirmed:
+        raise HTTPException(422, "Please confirm you own or have rights to process this video.")
+    vid, canonical = validate_yt(youtube_url)
+    oembed = await fetch_oembed(canonical)
+
+    pid = str(uuid.uuid4())
+    dest = UPLOADS_DIR / f"{pid}.mp4"
+
+    if video_file and video_file.filename:
+        with dest.open("wb") as out:
+            while chunk := await video_file.read(1024 * 512):
+                out.write(chunk)
+    elif direct_url and direct_url.strip().startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            async with client.stream("GET", direct_url.strip()) as r:
+                if r.status_code >= 400:
+                    raise HTTPException(422, f"Direct URL download failed (HTTP {r.status_code}).")
+                with dest.open("wb") as out:
+                    async for chunk in r.aiter_bytes(256 * 1024):
+                        out.write(chunk)
+    else:
+        raise HTTPException(422, "Please choose a video file from your device or paste a direct MP4 URL.")
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO projects (id, user_id, youtube_url, youtube_video_id, title, channel_name, thumbnail_url, source_path, status, progress, current_stage, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid, user["id"], canonical, vid, oembed["title"], oembed["channel_name"], oembed["thumbnail_url"], str(dest), "pending", 4, "Queued for AI analysis", time.time()),
+        )
+    background_tasks.add_task(run_analysis, pid)
+    return {"id": pid, "title": oembed["title"], "status": "pending"}
+
+
+@app.get("/api/projects")
+async def list_projects(user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, youtube_url, title, channel_name, duration_seconds, width, height, status, progress, current_stage, error_message, created_at FROM projects WHERE user_id=? ORDER BY created_at DESC",
+            (user["id"],),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/projects/{project_id}")
+async def project_detail(project_id: str, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        proj = conn.execute("SELECT * FROM projects WHERE id=? AND user_id=?", (project_id, user["id"])).fetchone()
+        if not proj:
+            raise HTTPException(404, "Project not found.")
+        clips = conn.execute("SELECT * FROM clips WHERE project_id=? ORDER BY viral_score DESC", (project_id,)).fetchall()
+    return {"project": dict(proj), "clips": [dict(c) for c in clips]}
+
+
+@app.post("/api/projects/{project_id}/retry")
+async def retry_project(project_id: str, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        p = conn.execute("SELECT id FROM projects WHERE id=? AND user_id=?", (project_id, user["id"])).fetchone()
+        if not p:
+            raise HTTPException(404, "Project not found.")
+        conn.execute("UPDATE projects SET status='pending', progress=3, current_stage='Retrying...', error_message=NULL WHERE id=?", (project_id,))
+    background_tasks.add_task(run_analysis, project_id)
+    return {"status": "requeued"}
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        p = conn.execute("SELECT source_path FROM projects WHERE id=? AND user_id=?", (project_id, user["id"])).fetchone()
+        if not p:
+            raise HTTPException(404, "Project not found.")
+        Path(p["source_path"]).unlink(missing_ok=True)
+        conn.execute("DELETE FROM projects WHERE id=? AND user_id=?", (project_id, user["id"]))
+    return {"deleted": True}
+
+
+@app.get("/api/projects/{project_id}/media")
+async def stream_source_media(project_id: str, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        p = conn.execute("SELECT source_path FROM projects WHERE id=? AND user_id=?", (project_id, user["id"])).fetchone()
+    if not p or not Path(p["source_path"]).exists():
+        raise HTTPException(404, "Media not found.")
+    return FileResponse(p["source_path"], media_type="video/mp4")
+
+
+@app.get("/api/clips/{clip_id}")
+async def get_clip(clip_id: str, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        clip = conn.execute("SELECT * FROM clips WHERE id=? AND user_id=?", (clip_id, user["id"])).fetchone()
+        if not clip:
+            raise HTTPException(404, "Clip not found.")
+        proj = conn.execute("SELECT duration_seconds, title FROM projects WHERE id=?", (clip["project_id"],)).fetchone()
+        captions = conn.execute("SELECT * FROM captions WHERE clip_id=? ORDER BY seq_index ASC", (clip_id,)).fetchall()
+    return {"clip": dict(clip), "project_duration": proj["duration_seconds"], "project_title": proj["title"], "captions": [dict(c) for c in captions]}
+
+
+@app.patch("/api/clips/{clip_id}")
+async def update_clip(clip_id: str, body: UpdateClipBody, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        clip = conn.execute("SELECT * FROM clips WHERE id=? AND user_id=?", (clip_id, user["id"])).fetchone()
+        if not clip:
+            raise HTTPException(404, "Clip not found.")
+        proj = conn.execute("SELECT duration_seconds, transcript_json FROM projects WHERE id=?", (clip["project_id"],)).fetchone()
+        max_d = float(proj["duration_seconds"] or 3600)
+        ns = max(0.0, min(body.start_seconds if body.start_seconds is not None else clip["start_seconds"], max_d - 1.0))
+        ne = min(max_d, max(ns + 1.0, body.end_seconds if body.end_seconds is not None else clip["end_seconds"]))
+        cm = body.crop_mode or clip["crop_mode"]
+        cp = body.caption_position or clip["caption_position"]
+        conn.execute("UPDATE clips SET start_seconds=?, end_seconds=?, crop_mode=?, caption_position=? WHERE id=?", (round(ns, 2), round(ne, 2), cm, cp, clip_id))
+        if body.start_seconds is not None or body.end_seconds is not None:
+            tr = json.loads(proj["transcript_json"] or "[]")
+            conn.execute("DELETE FROM captions WHERE clip_id=?", (clip_id,))
+            for cue in slice_captions(tr, ns, ne):
+                conn.execute(
+                    "INSERT INTO captions (id, clip_id, seq_index, start_seconds, end_seconds, text, words_json) VALUES (?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), clip_id, cue["seq_index"], cue["start_seconds"], cue["end_seconds"], cue["text"], json.dumps(cue["words_json"])),
+                )
+        updated = dict(conn.execute("SELECT * FROM clips WHERE id=?", (clip_id,)).fetchone())
+        caps = [dict(r) for r in conn.execute("SELECT * FROM captions WHERE clip_id=? ORDER BY seq_index ASC", (clip_id,)).fetchall()]
+    return {"clip": updated, "captions": caps}
+
+
+@app.put("/api/clips/{clip_id}/captions")
+async def save_captions(clip_id: str, body: UpdateCaptionsBody, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        clip = conn.execute("SELECT id FROM clips WHERE id=? AND user_id=?", (clip_id, user["id"])).fetchone()
+        if not clip:
+            raise HTTPException(404, "Clip not found.")
+        conn.execute("DELETE FROM captions WHERE clip_id=?", (clip_id,))
+        for idx, c in enumerate(sorted(body.captions, key=lambda x: x.start_seconds)):
+            if c.end_seconds > c.start_seconds and c.text.strip():
+                conn.execute(
+                    "INSERT INTO captions (id, clip_id, seq_index, start_seconds, end_seconds, text, words_json) VALUES (?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), clip_id, idx, round(c.start_seconds, 2), round(c.end_seconds, 2), c.text.strip(), "[]"),
+                )
+        caps = [dict(r) for r in conn.execute("SELECT * FROM captions WHERE clip_id=? ORDER BY seq_index ASC", (clip_id,)).fetchall()]
+    return {"captions": caps}
+
+
+@app.post("/api/clips/{clip_id}/export")
+async def start_export(clip_id: str, body: ExportBody, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        clip = conn.execute("SELECT id FROM clips WHERE id=? AND user_id=?", (clip_id, user["id"])).fetchone()
+        if not clip:
+            raise HTTPException(404, "Clip not found.")
+        conn.execute(
+            "UPDATE clips SET crop_mode=?, caption_position=?, export_status='queued', export_progress=2, export_stage='Queued...', export_error=NULL WHERE id=?",
+            (body.crop_mode, body.caption_position, clip_id),
+        )
+    background_tasks.add_task(run_export, clip_id, body.quality, body.crop_mode, body.caption_position)
+    return {"status": "queued"}
+
+
+@app.get("/api/clips/{clip_id}/download")
+async def download_export(clip_id: str, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        c = conn.execute("SELECT export_path, title FROM clips WHERE id=? AND user_id=?", (clip_id, user["id"])).fetchone()
+    if not c or not c["export_path"] or not Path(c["export_path"]).exists():
+        raise HTTPException(404, "Export file not ready.")
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", c["title"])[:30]
+    return FileResponse(c["export_path"], media_type="video/mp4", filename=f"viral_clip_{safe}.mp4")
+
+
+@app.get("/api/events/projects/{project_id}")
+async def sse_project(project_id: str, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        p = conn.execute("SELECT status, current_stage, progress, error_message FROM projects WHERE id=? AND user_id=?", (project_id, user["id"])).fetchone()
+    if not p:
+        raise HTTPException(404, "Project not found.")
+
+    async def gen():
+        q = await bus.subscribe(f"project:{project_id}")
+        try:
+            yield f"data: {json.dumps({'status': p['status'], 'stage': p['current_stage'], 'progress': p['progress'], 'message': p['error_message'] or ''})}\n\n"
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {msg}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            bus.unsubscribe(f"project:{project_id}", q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/events/clips/{clip_id}")
+async def sse_clip(clip_id: str, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        c = conn.execute("SELECT export_status, export_stage, export_progress, export_error FROM clips WHERE id=? AND user_id=?", (clip_id, user["id"])).fetchone()
+    if not c:
+        raise HTTPException(404, "Clip not found.")
+
+    async def gen():
+        q = await bus.subscribe(f"clip:{clip_id}")
+        try:
+            yield f"data: {json.dumps({'status': c['export_status'], 'stage': c['export_stage'], 'progress': c['export_progress'], 'message': c['export_error'] or ''})}\n\n"
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {msg}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            bus.unsubscribe(f"clip:{clip_id}", q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+''', encoding="utf-8")
+
+Path("static/index.html").write_text(r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>VIRAL CLIPPER — AI Studio</title>
+<style>
+  :root {
+    --bg: #04060a; --surface: #0b1018; --card: #121926; --border: #1f2d45;
+    --neon: #00e5ff; --blue: #007bff; --text: #f4f8ff; --muted: #8c9bb5;
+    --green: #00e676; --red: #ff3d71;
+  }
+  * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { margin: 0; background: var(--bg); color: var(--text); padding-bottom: 84px; }
+  .app { max-width: 520px; margin: 0 auto; min-height: 100vh; padding: 16px; }
+  .brand { font-size: 22px; font-weight: 900; color: var(--neon); letter-spacing: 1.5px; text-shadow: 0 0 14px rgba(0,229,255,.45); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin-bottom: 14px; }
+  .card.glow { border-color: rgba(0,229,255,.55); box-shadow: 0 0 18px rgba(0,229,255,.12); }
+  h2 { margin: 0 0 8px; font-size: 18px; }
+  p.muted { color: var(--muted); font-size: 13px; margin: 4px 0 10px; line-height: 1.45; }
+  input, select, textarea {
+    width: 100%; background: var(--surface); color: var(--text); border: 1px solid var(--border);
+    border-radius: 12px; padding: 12px; font-size: 14px; margin-bottom: 10px; outline: none;
+  }
+  input:focus { border-color: var(--neon); }
+  .btn {
+    width: 100%; border: none; border-radius: 13px; padding: 13px 16px; font-weight: 800; font-size: 14px;
+    cursor: pointer; color: #04060a; background: linear-gradient(90deg, var(--neon), var(--blue));
+    box-shadow: 0 4px 18px rgba(0,229,255,.32);
+  }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn.outline { background: transparent; color: var(--neon); border: 1px solid var(--neon); box-shadow: none; }
+  .btn.danger { background: rgba(255,61,113,.15); color: var(--red); border: 1px solid var(--red); box-shadow: none; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row > * { flex: 1; }
+  .chip { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; background: rgba(0,229,255,.14); color: var(--neon); border: 1px solid rgba(0,229,255,.4); }
+  .chip.ok { color: var(--green); background: rgba(0,230,118,.14); border-color: var(--green); }
+  .chip.err { color: var(--red); background: rgba(255,61,113,.14); border-color: var(--red); }
+  .progress-wrap { background: var(--surface); border-radius: 999px; height: 10px; overflow: hidden; margin: 10px 0; }
+  .progress-bar { height: 100%; background: linear-gradient(90deg, var(--neon), var(--blue)); transition: width .25s; }
+  .nav {
+    position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid var(--border);
+    display: flex; justify-content: space-around; padding: 10px 6px; z-index: 30;
+  }
+  .nav button { background: none; border: none; color: var(--muted); font-size: 12px; font-weight: 700; cursor: pointer; }
+  .nav button.active { color: var(--neon); }
+  .preview-frame {
+    position: relative; width: 260px; height: 462px; margin: 0 auto 14px; background: #000;
+    border-radius: 18px; overflow: hidden; border: 2px solid rgba(0,229,255,.65);
+  }
+  .preview-frame video { width: 100%; height: 100%; object-fit: cover; }
+  .preview-frame.fit video { object-fit: contain; }
+  .sub-overlay {
+    position: absolute; left: 10px; right: 10px; text-align: center; pointer-events: none;
+    font-weight: 900; font-size: 17px; color: var(--neon); text-shadow: 0 2px 6px #000, 0 0 8px #000;
+    background: rgba(0,0,0,.55); padding: 6px 8px; border-radius: 8px;
+  }
+  .sub-bottom { bottom: 42px; } .sub-center { top: 46%; } .sub-top { top: 28px; }
+  .hidden { display: none !important; }
+  .err-txt { color: var(--red); font-size: 13px; margin: 6px 0; }
+  .ok-txt { color: var(--green); font-size: 13px; margin: 6px 0; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="row" style="margin-bottom:14px;">
+    <div class="brand">VIRAL CLIPPER</div>
+    <div style="text-align:right;"><button id="btn-logout" class="btn outline hidden" style="width:auto;padding:6px 12px;font-size:12px;" onclick="logout()">Sign Out</button></div>
+  </div>
+
+  <!-- AUTH SCREEN -->
+  <div id="scr-auth" class="card glow">
+    <h2 id="auth-title">Sign In</h2>
+    <p class="muted">AI Viral Highlight Detector & 9:16 1080p Caption Studio</p>
+    <div class="row" style="margin-bottom:10px;">
+      <button class="btn outline" onclick="setAuthMode(false)">Login</button>
+      <button class="btn outline" onclick="setAuthMode(true)">Sign Up</button>
+    </div>
+    <input id="auth-name" class="hidden" placeholder="Creator Name" />
+    <input id="auth-email" type="email" placeholder="Email" />
+    <input id="auth-pass" type="password" placeholder="Password (6+ chars)" />
+    <div id="auth-err" class="err-txt"></div>
+    <button class="btn" onclick="submitAuth()">Continue</button>
+  </div>
+
+  <!-- HOME / PROJECTS -->
+  <div id="scr-home" class="hidden">
+    <div class="card glow">
+      <h2>Create Viral Short Clips</h2>
+      <p class="muted">Validate a YouTube video, attach your creator MP4 (or direct URL), and let Whisper + Gemini extract top viral moments.</p>
+      <button class="btn" onclick="go('import')">+ Import New Video</button>
+    </div>
+    <div class="row" style="margin-bottom:10px;">
+      <h2 style="margin:0;">My Projects</h2>
+      <button class="btn outline" style="width:auto;padding:6px 12px;" onclick="loadProjects()">Refresh</button>
+    </div>
+    <div id="projects-list"></div>
+  </div>
+
+  <!-- IMPORT SCREEN -->
+  <div id="scr-import" class="hidden">
+    <div class="card glow">
+      <h2>1. YouTube URL Reference</h2>
+      <input id="yt-url" placeholder="https://youtube.com/watch?v=..." />
+      <button class="btn outline" onclick="validateYoutube()">Validate YouTube URL</button>
+      <div id="yt-meta" class="ok-txt"></div>
+    </div>
+    <div class="card">
+      <h2>2. Video Source (Permitted)</h2>
+      <p class="muted">Pick your video file from phone gallery OR paste a licensed direct MP4 URL:</p>
+      <input id="vid-file" type="file" accept="video/*" />
+      <input id="vid-direct" placeholder="Or direct MP4 URL (https://...)" />
+      <label style="display:flex;gap:8px;align-items:center;font-size:13px;margin:8px 0;">
+        <input id="rights-chk" type="checkbox" style="width:auto;margin:0;" />
+        I own this video or have permission to clip & transform it.
+      </label>
+      <div id="imp-err" class="err-txt"></div>
+      <div id="imp-prog" class="hidden">
+        <p class="muted" id="imp-prog-txt">Uploading...</p>
+        <div class="progress-wrap"><div id="imp-bar" class="progress-bar" style="width:0%"></div></div>
+      </div>
+      <button id="btn-start-ai" class="btn" onclick="startUploadAndAnalyze()">Upload & Run AI Analysis</button>
+    </div>
+  </div>
+
+  <!-- AI ANALYSIS PROGRESS -->
+  <div id="scr-analysis" class="hidden">
+    <div class="card glow" style="text-align:center;">
+      <h2>AI Pipeline Processing</h2>
+      <div id="ana-pct" style="font-size:38px;font-weight:900;color:var(--neon);">0%</div>
+      <p id="ana-stage" class="muted">Connecting...</p>
+      <div class="progress-wrap"><div id="ana-bar" class="progress-bar" style="width:0%"></div></div>
+      <div id="ana-err" class="err-txt"></div>
+      <button id="btn-retry-ana" class="btn hidden" onclick="retryCurrentProject()">Retry Processing</button>
+    </div>
+  </div>
+
+  <!-- CLIP SELECTION -->
+  <div id="scr-clips" class="hidden">
+    <button class="btn outline" style="margin-bottom:12px;" onclick="go('home')">← Back to Projects</button>
+    <h2 id="clips-proj-title">Viral Clips</h2>
+    <div id="clips-list"></div>
+  </div>
+
+  <!-- CLIP STUDIO (PREVIEW + TRIM + CAPTIONS + EXPORT) -->
+  <div id="scr-studio" class="hidden">
+    <button class="btn outline" style="margin-bottom:12px;" onclick="openProjectClips(state.projectId)">← Back to Clips</button>
+    <div class="card glow">
+      <h2 id="stu-title">Clip Studio</h2>
+      <div id="preview-box" class="preview-frame">
+        <video id="stu-video" controls playsinline></video>
+        <div id="stu-sub" class="sub-overlay sub-bottom hidden"></div>
+      </div>
+      <div class="row" style="margin-bottom:10px;">
+        <select id="stu-crop" onchange="saveTrimAndMode(false)">
+          <option value="center_crop">9:16 Center Crop</option>
+          <option value="fit_blur">9:16 Blur Fit</option>
+        </select>
+        <select id="stu-pos" onchange="saveTrimAndMode(false)">
+          <option value="bottom">Captions: Bottom</option>
+          <option value="center">Captions: Center</option>
+          <option value="top">Captions: Top</option>
+        </select>
+      </div>
+      <div class="row">
+        <div><label class="muted">Start (sec)</label><input id="stu-start" type="number" step="0.1" /></div>
+        <div><label class="muted">End (sec)</label><input id="stu-end" type="number" step="0.1" /></div>
+      </div>
+      <button class="btn outline" onclick="saveTrimAndMode(true)">Update Trim & Resync Captions</button>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:8px;">
+        <h2 style="margin:0;">Synchronized Captions</h2>
+        <button class="btn outline" style="width:auto;padding:6px 12px;" onclick="addCue()">+ Cue</button>
+      </div>
+      <div id="cues-list"></div>
+      <div id="cap-msg" class="ok-txt"></div>
+      <button class="btn" onclick="saveCaptions()">Save Captions</button>
+    </div>
+
+    <div class="card glow">
+      <h2>Export 9:16 MP4</h2>
+      <select id="exp-quality">
+        <option value="1080p">1080p Full HD (1080x1920)</option>
+        <option value="720p">720p Fast (720x1280)</option>
+      </select>
+      <div id="exp-prog-box" class="hidden">
+        <p class="muted" id="exp-stage">Rendering...</p>
+        <div class="progress-wrap"><div id="exp-bar" class="progress-bar" style="width:0%"></div></div>
+      </div>
+      <div id="exp-err" class="err-txt"></div>
+      <a id="btn-download-mp4" class="btn hidden" style="display:block;text-align:center;text-decoration:none;margin-bottom:10px;" download>⬇ Download Exported MP4</a>
+      <button id="btn-export" class="btn" onclick="triggerExport()">Render & Export MP4</button>
+    </div>
+  </div>
+</div>
+
+<div id="bottom-nav" class="nav hidden">
+  <button onclick="go('home')" id="nav-home">🏠 Projects</button>
+  <button onclick="go('import')" id="nav-import">➕ Import</button>
+</div>
+
+<script>
+const state = {
+  token: localStorage.getItem("vc_token") || "",
+  isSignUp: false,
+  projectId: null,
+  clipId: null,
+  clip: null,
+  captions: [],
+  sse: null
+};
+
+async function api(path, opts = {}) {
+  const headers = opts.headers || {};
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  if (!(opts.body instanceof FormData) && opts.body && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+  const r = await fetch(path, { ...opts, headers });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || "Request failed (" + r.status + ")");
+  return data;
+}
+
+function go(screen) {
+  ["auth", "home", "import", "analysis", "clips", "studio"].forEach(s => {
+    document.getElementById("scr-" + s).classList.toggle("hidden", s !== screen);
+  });
+  const logged = !!state.token && screen !== "auth";
+  document.getElementById("bottom-nav").classList.toggle("hidden", !logged);
+  document.getElementById("btn-logout").classList.toggle("hidden", !logged);
+  if (screen === "home") loadProjects();
+}
+
+function setAuthMode(signUp) {
+  state.isSignUp = signUp;
+  document.getElementById("auth-title").textContent = signUp ? "Create Account" : "Sign In";
+  document.getElementById("auth-name").classList.toggle("hidden", !signUp);
+}
+
+async function submitAuth() {
+  const err = document.getElementById("auth-err");
+  err.textContent = "";
+  try {
+    const endpoint = state.isSignUp ? "/api/auth/register" : "/api/auth/login";
+    const res = await api(endpoint, {
+      method: "POST",
+      body: JSON.stringify({
+        email: document.getElementById("auth-email").value,
+        password: document.getElementById("auth-pass").value,
+        full_name: document.getElementById("auth-name").value
+      })
+    });
+    state.token = res.token;
+    localStorage.setItem("vc_token", state.token);
+    go("home");
+  } catch (e) { err.textContent = e.message; }
+}
+
+function logout() {
+  state.token = "";
+  localStorage.removeItem("vc_token");
+  go("auth");
+}
+
+async function loadProjects() {
+  const box = document.getElementById("projects-list");
+  box.innerHTML = `<p class="muted">Loading...</p>`;
+  try {
+    const list = await api("/api/projects");
+    if (!list.length) {
+      box.innerHTML = `<div class="card"><p class="muted">No projects yet. Tap "+ Import New Video" to start!</p></div>`;
+      return;
+    }
+    box.innerHTML = list.map(p => `
+      <div class="card">
+        <div class="row">
+          <div style="flex:3;"><b>${esc(p.title)}</b><div class="muted" style="font-size:12px;">${esc(p.current_stage)} (${p.progress}%)</div></div>
+          <span class="chip ${p.status==='ready'?'ok':(p.status==='failed'?'err':'')}">${p.status.toUpperCase()}</span>
+        </div>
+        ${p.error_message ? `<div class="err-txt">${esc(p.error_message)}</div>` : ""}
+        <div class="row" style="margin-top:10px;">
+          <button class="btn" onclick="${p.status==='ready' ? `openProjectClips('${p.id}')` : `watchAnalysis('${p.id}')`}">${p.status==='ready' ? 'View Viral Clips' : 'Open Status'}</button>
+          <button class="btn danger" style="flex:0.4;" onclick="delProject('${p.id}')">Del</button>
+        </div>
+      </div>
+    `).join("");
+  } catch (e) {
+    if (e.message.includes("session")) logout();
+    else box.innerHTML = `<div class="err-txt">${esc(e.message)}</div>`;
+  }
+}
+
+async function delProject(id) {
+  await api("/api/projects/" + id, { method: "DELETE" });
+  loadProjects();
+}
+
+async function validateYoutube() {
+  const meta = document.getElementById("yt-meta");
+  const err = document.getElementById("imp-err");
+  meta.textContent = ""; err.textContent = "";
+  try {
+    const res = await api("/api/projects/validate-youtube?url=" + encodeURIComponent(document.getElementById("yt-url").value));
+    meta.textContent = "Verified: " + res.title + (res.channel_name ? " (" + res.channel_name + ")" : "");
+  } catch (e) { err.textContent = e.message; }
+}
+
+function startUploadAndAnalyze() {
+  const err = document.getElementById("imp-err");
+  err.textContent = "";
+  const yt = document.getElementById("yt-url").value.trim();
+  const file = document.getElementById("vid-file").files[0];
+  const direct = document.getElementById("vid-direct").value.trim();
+  const rights = document.getElementById("rights-chk").checked;
+  if (!yt) { err.textContent = "Enter a YouTube URL."; return; }
+  if (!rights) { err.textContent = "Confirm rights/ownership checkbox."; return; }
+  if (!file && !direct) { err.textContent = "Select a video file or paste a direct MP4 URL."; return; }
+
+  const fd = new FormData();
+  fd.append("youtube_url", yt);
+  fd.append("rights_confirmed", "true");
+  if (file) fd.append("video_file", file);
+  else fd.append("direct_url", direct);
+
+  const xhr = new XMLHttpRequest();
+  document.getElementById("imp-prog").classList.remove("hidden");
+  document.getElementById("btn-start-ai").disabled = true;
+
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      document.getElementById("imp-bar").style.width = pct + "%";
+      document.getElementById("imp-prog-txt").textContent = "Uploading to server: " + pct + "%";
+    }
+  };
+  xhr.onload = () => {
+    document.getElementById("btn-start-ai").disabled = false;
+    document.getElementById("imp-prog").classList.add("hidden");
+    const res = JSON.parse(xhr.responseText || "{}");
+    if (xhr.status >= 200 && xhr.status < 300) {
+      watchAnalysis(res.id);
+    } else {
+      err.textContent = res.detail || "Upload failed";
+    }
+  };
+  xhr.onerror = () => {
+    document.getElementById("btn-start-ai").disabled = false;
+    err.textContent = "Network error during upload.";
+  };
+  xhr.open("POST", "/api/projects");
+  xhr.setRequestHeader("Authorization", "Bearer " + state.token);
+  xhr.send(fd);
+}
+
+function watchAnalysis(projectId) {
+  state.projectId = projectId;
+  go("analysis");
+  document.getElementById("ana-err").textContent = "";
+  document.getElementById("btn-retry-ana").classList.add("hidden");
+  if (state.sse) state.sse.close();
+  state.sse = new EventSource(`/api/events/projects/${projectId}?token=${encodeURIComponent(state.token)}`);
+  state.sse.onmessage = e => {
+    const d = JSON.parse(e.data);
+    document.getElementById("ana-pct").textContent = d.progress + "%";
+    document.getElementById("ana-bar").style.width = d.progress + "%";
+    document.getElementById("ana-stage").textContent = d.stage;
+    if (d.status === "failed") {
+      document.getElementById("ana-err").textContent = d.message;
+      document.getElementById("btn-retry-ana").classList.remove("hidden");
+      state.sse.close();
+    } else if (d.status === "ready") {
+      state.sse.close();
+      openProjectClips(projectId);
+    }
+  };
+}
+
+async function retryCurrentProject() {
+  await api(`/api/projects/${state.projectId}/retry`, { method: "POST" });
+  watchAnalysis(state.projectId);
+}
+
+async function openProjectClips(projectId) {
+  state.projectId = projectId;
+  go("clips");
+  const d = await api(`/api/projects/${projectId}`);
+  document.getElementById("clips-proj-title").textContent = d.project.title;
+  document.getElementById("clips-list").innerHTML = d.clips.map(c => `
+    <div class="card ${c.viral_score>=85?'glow':''}">
+      <div class="row">
+        <b style="flex:3;">${esc(c.title)}</b>
+        <span class="chip ok">VIRAL ${c.viral_score}%</span>
+      </div>
+      <div class="ok-txt">${c.start_seconds.toFixed(1)}s → ${c.end_seconds.toFixed(1)}s (${(c.end_seconds-c.start_seconds).toFixed(1)}s)</div>
+      <p class="muted">${esc(c.hook_reason)}</p>
+      <button class="btn" onclick="openStudio('${c.id}')">Open Clip Studio</button>
+    </div>
+  `).join("");
+}
+
+async function openStudio(clipId) {
+  state.clipId = clipId;
+  go("studio");
+  const d = await api(`/api/clips/${clipId}`);
+  state.clip = d.clip;
+  state.captions = d.captions;
+  document.getElementById("stu-title").textContent = d.clip.title;
+  document.getElementById("stu-start").value = d.clip.start_seconds;
+  document.getElementById("stu-end").value = d.clip.end_seconds;
+  document.getElementById("stu-crop").value = d.clip.crop_mode;
+  document.getElementById("stu-pos").value = d.clip.caption_position;
+
+  const vid = document.getElementById("stu-video");
+  vid.src = `/api/projects/${d.clip.project_id}/media?token=${encodeURIComponent(state.token)}#t=${d.clip.start_seconds},${d.clip.end_seconds}`;
+  vid.ontimeupdate = () => {
+    const rel = vid.currentTime - state.clip.start_seconds;
+    if (vid.currentTime >= state.clip.end_seconds) { vid.currentTime = state.clip.start_seconds; }
+    const cue = state.captions.find(x => rel >= x.start_seconds && rel <= x.end_seconds);
+    const sub = document.getElementById("stu-sub");
+    sub.className = "sub-overlay sub-" + document.getElementById("stu-pos").value;
+    if (cue) { sub.textContent = cue.text.toUpperCase(); sub.classList.remove("hidden"); }
+    else sub.classList.add("hidden");
+  };
+  document.getElementById("preview-box").classList.toggle("fit", d.clip.crop_mode === "fit_blur");
+  renderCues();
+  refreshExportUI(d.clip);
+}
+
+function renderCues() {
+  document.getElementById("cues-list").innerHTML = state.captions.map((c, i) => `
+    <div style="border-bottom:1px solid var(--border);padding:8px 0;">
+      <div class="row" style="margin-bottom:6px;">
+        <input type="number" step="0.1" value="${c.start_seconds}" onchange="state.captions[${i}].start_seconds=parseFloat(this.value)" />
+        <input type="number" step="0.1" value="${c.end_seconds}" onchange="state.captions[${i}].end_seconds=parseFloat(this.value)" />
+        <button class="btn danger" style="flex:0.4;padding:8px;" onclick="state.captions.splice(${i},1);renderCues()">✕</button>
+      </div>
+      <input value="${esc(c.text)}" onchange="state.captions[${i}].text=this.value" />
+    </div>
+  `).join("");
+}
+
+function addCue() {
+  const last = state.captions[state.captions.length - 1];
+  const st = last ? last.end_seconds : 0;
+  state.captions.push({ seq_index: state.captions.length, start_seconds: st, end_seconds: st + 2, text: "New caption" });
+  renderCues();
+}
+
+async function saveTrimAndMode(resync) {
+  const crop = document.getElementById("stu-crop").value;
+  const pos = document.getElementById("stu-pos").value;
+  document.getElementById("preview-box").classList.toggle("fit", crop === "fit_blur");
+  const payload = { crop_mode: crop, caption_position: pos };
+  if (resync) {
+    payload.start_seconds = parseFloat(document.getElementById("stu-start").value);
+    payload.end_seconds = parseFloat(document.getElementById("stu-end").value);
+  }
+  const res = await api(`/api/clips/${state.clipId}`, { method: "PATCH", body: JSON.stringify(payload) });
+  state.clip = res.clip;
+  if (resync) {
+    state.captions = res.captions;
+    renderCues();
+    document.getElementById("stu-video").currentTime = res.clip.start_seconds;
+  }
+}
+
+async function saveCaptions() {
+  const msg = document.getElementById("cap-msg");
+  msg.textContent = "";
+  const res = await api(`/api/clips/${state.clipId}/captions`, {
+    method: "PUT",
+    body: JSON.stringify({ captions: state.captions })
+  });
+  state.captions = res.captions;
+  renderCues();
+  msg.textContent = "Captions saved!";
+}
+
+function refreshExportUI(clip) {
+  const dl = document.getElementById("btn-download-mp4");
+  if (clip.export_status === "completed") {
+    dl.href = `/api/clips/${clip.id}/download?token=${encodeURIComponent(state.token)}`;
+    dl.textContent = `⬇ Download ${clip.export_resolution || ''} MP4 (${(clip.export_size_bytes/(1024*1024)).toFixed(1)} MB)`;
+    dl.classList.remove("hidden");
+  } else {
+    dl.classList.add("hidden");
+  }
+}
+
+async function triggerExport() {
+  document.getElementById("e
